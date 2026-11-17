@@ -21,7 +21,88 @@ export type ProceduralModelRuntime = {
   sockets: Record<string, THREE.Object3D>;
   colliders: Record<string, unknown>;
   destructionGroups: Record<string, THREE.Object3D[]>;
+  parts?: string[];
+  partOf?: (object: THREE.Object3D | null | undefined) => string | null;
+  pick?: (raycaster: THREE.Raycaster) => string | null;
+  explode?: (amount: number) => Record<string, [number, number, number]>;
+  manifest?: () => PartManifest;
 };
+
+export type PartManifest = {
+  model: string;
+  parts: { name: string; label: string; kind: 'part'; module: string; triangles: number }[];
+  unnamedMeshes: number;
+  integralMeshes: number;
+};
+
+// Parts = components whose mesh is not surface detail (`userData.explodeWithParent`). The root
+// component stays put in explode. Separation SCALES each part's offset from the model centre
+// (plus a base clearance so near-centre parts still open), never a uniform push.
+function attachPartRuntime(root: THREE.Object3D, rt: ProceduralModelRuntime): ProceduralModelRuntime {
+  const isDetail = (m: THREE.Object3D | undefined) => m?.userData?.explodeWithParent === true;
+  const rootId = Object.keys(rt.nodes).find((id) => rt.nodes[id].parent === root) ?? null;
+  const parts = Object.keys(rt.meshes).filter((id) => !isDetail(rt.meshes[id]));
+  const partOf = (object: THREE.Object3D | null | undefined): string | null => {
+    let o: THREE.Object3D | null | undefined = object;
+    while (o) {
+      const id = o.userData?.sculptComponent?.id as string | undefined;
+      if (id && rt.meshes[id] === o && !isDetail(o)) return id;
+      if (id && rt.nodes[id] === o && rt.meshes[id] && !isDetail(rt.meshes[id])) return id;
+      o = o.parent;
+    }
+    return null;
+  };
+  const pick = (raycaster: THREE.Raycaster): string | null => {
+    for (const hit of raycaster.intersectObject(root, true)) {
+      if ((hit.object as THREE.Mesh).isMesh && hit.object.visible) return partOf(hit.object);
+    }
+    return null;
+  };
+  const base = new Map<string, THREE.Vector3>();
+  const explode = (amount: number): Record<string, [number, number, number]> => {
+    root.updateMatrixWorld(true);
+    const toRoot = new THREE.Matrix4().copy(root.matrixWorld).invert();
+    const centreOf = (o: THREE.Object3D) =>
+      new THREE.Box3().setFromObject(o).getCenter(new THREE.Vector3()).applyMatrix4(toRoot);
+    const modelBox = new THREE.Box3().setFromObject(root);
+    const modelCentre = modelBox.getCenter(new THREE.Vector3()).applyMatrix4(toRoot);
+    const clearance = modelBox.getSize(new THREE.Vector3()).length() * 0.06;
+    const moved: Record<string, [number, number, number]> = {};
+    for (const id of parts) {
+      const node = rt.nodes[id];
+      if (!node || id === rootId) continue;
+      if (!base.has(id)) base.set(id, node.position.clone());
+      node.position.copy(base.get(id)!);
+      if (amount <= 0) continue;
+      root.updateMatrixWorld(true);
+      const away = centreOf(rt.meshes[id]).sub(modelCentre);
+      const dir = away.lengthSq() > 1e-12 ? away.clone().normalize() : new THREE.Vector3(0, 1, 0);
+      const offset = away.multiplyScalar(amount).add(dir.multiplyScalar(clearance * amount));
+      // offset is in root space; convert to the node's parent space before applying
+      const parent = node.parent ?? root;
+      const parentFromRoot = new THREE.Matrix4().copy(parent.matrixWorld).invert().multiply(root.matrixWorld);
+      const local = offset.clone().transformDirection(parentFromRoot).multiplyScalar(offset.length());
+      node.position.add(local);
+      moved[id] = [local.x, local.y, local.z];
+    }
+    root.updateMatrixWorld(true);
+    return moved;
+  };
+  const manifest = (): PartManifest => {
+    const out: PartManifest = { model: root.name, parts: [], unnamedMeshes: 0, integralMeshes: 0 };
+    root.traverse((o) => {
+      const mesh = o as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      const id = o.userData?.sculptComponent?.id as string | undefined;
+      if (!o.name || !id) { out.unnamedMeshes++; return; }
+      const g = mesh.geometry;
+      const triangles = Math.round(g.index ? g.index.count / 3 : g.attributes.position.count / 3);
+      out.parts.push({ name: id, label: o.name, kind: 'part', module: partOf(o) ?? id, triangles });
+    });
+    return out;
+  };
+  return { ...rt, parts, partOf, pick, explode, manifest };
+}
 
 type SculptMaterialSpec = Record<string, any>;
 
@@ -678,7 +759,7 @@ export function createTradeItHardCaseModel(options: ProceduralModelOptions = {})
   meshes["lid"] = mesh_lid_1;
   colliders["lid"] = {"type": "box", "offset": [0, 0, 0], "scale": [1, 1, 1], "isTrigger": false, "notes": "Coarse proxy; refine after first browser render."};
 
-  root.userData.sculptRuntime = { nodes, meshes, sockets, colliders, destructionGroups } satisfies ProceduralModelRuntime;
+  root.userData.sculptRuntime = attachPartRuntime(root, { nodes, meshes, sockets, colliders, destructionGroups });
   root.userData.lookDevTargets = {"qualityPriority": "reference-fidelity", "materialPass": {"albedoPaletteRequired": true, "roughnessVariationRequired": true, "normalOrBumpRequired": true, "localOverridesRequired": true, "minimumTextureResolution": 1024, "preferredTextureResolution": 2048, "independentMapChannels": ["albedo", "roughness", "height", "normal", "ambient-occlusion"], "requiredSurfaceFrequencyBands": ["macro", "meso", "micro"], "geometryReliefRequiredWhenSilhouetteAffected": true, "referencePbrExtraction": {"requiredWhenSourceImagePresent": false, "targetThreshold": 0.7, "stopOnLowConfidence": true, "script": "forge/stage1_intake/extract_pbr_evidence.py", "acceptedLimitation": "single-image extraction is reference-derived inference, not exact photogrammetry", "skipReason": "Flat matte-plastic shell + 2-color printed decal, no patterned/photoreal skin -- scalar PBR values estimated by eye per grimoire/build/threejs_texture_reference.md 'solid albedo for flat paint' rule instead of extract_pbr_evidence.py. See spec.risks[0]."}, "mustAvoid": ["single flat albedo per material", "uniform roughness", "albedo texture reused as roughness/height/normal/AO", "single-frequency random noise", "plastic-looking smooth bark, stone, cloth, foliage, or aged material", "local color/detail described only in prose without material masks", "claiming exact PBR recovery when confidence is below the target threshold"]}, "lightingPass": {"requiredTerms": ["key light", "fill light", "rim or environment light", "exposure", "tone mapping", "background", "contact shadow"], "mustAvoid": ["ambient-only lighting", "flat value range", "missing contact shadow", "reference lighting copied without separating material readability"]}, "screenshotReview": ["Compare albedo palette and local color zones.", "Compare roughness/normal/bump response under light.", "Compare cavity dirt, edge wear, stains, moss, scratches, or other local masks.", "Compare key/fill/rim structure, exposure, tone mapping, background, and contact shadows.", "Capture a neutral-light render to verify material readability without reference lighting.", "Capture a grazing-light close-up to expose flat normals, uniform roughness, tiling, and plastic highlights.", "Capture a reference-matched render from the same camera framing as the source."]};
   root.userData.actionReadiness = {
     note: 'Use root.userData.sculptRuntime.nodes for transforms, sockets for attachments, colliders for physics proxies, and destructionGroups for breakable sets.',
@@ -738,6 +819,32 @@ export function createTradeItHardCaseEnvironment(renderer: THREE.WebGLRenderer):
   const texture = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
   pmrem.dispose();
   return texture;
+}
+
+// three r163+ ignores material.envMapIntensity when the environment comes only from
+// scene.environment (a measured orange grip rendered #ff8954 instead of #e85f29). Call this
+// after assigning scene.environment: materials that set their own envMapIntensity get the
+// environment bound per material, with the scene's environmentIntensity folded in (a bound
+// envMap no longer receives it). Materials at the default 1 keep using scene.environment.
+export function bindTradeItHardCaseEnvironment(
+  root: THREE.Object3D,
+  environment: THREE.Texture,
+  environmentIntensity = 1,
+): number {
+  let bound = 0;
+  root.traverse((o) => {
+    const mesh = o as THREE.Mesh;
+    if (!mesh.isMesh) return;
+    for (const m of Array.isArray(mesh.material) ? mesh.material : [mesh.material]) {
+      const pbr = m as THREE.MeshStandardMaterial;
+      if (typeof pbr.envMapIntensity !== 'number' || pbr.envMapIntensity === 1 || pbr.envMap) continue;
+      pbr.envMap = environment;
+      pbr.envMapIntensity *= environmentIntensity;
+      pbr.needsUpdate = true;
+      bound++;
+    }
+  });
+  return bound;
 }
 
 // Plan 1.3 §3.2 — auto-framing by bounding box. The Divine Eye can only compare a
