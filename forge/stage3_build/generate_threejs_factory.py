@@ -1792,6 +1792,55 @@ def stand_proud_ring_stack(component: dict[str, Any]) -> list[list[float]] | Non
     return None
 
 
+_HEX_COLOR = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def _num(value: Any) -> float | None:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def photo_light_rig(lighting: Any) -> list[dict[str, Any]]:
+    """The measured light rig in `lightingFromPhoto`, or [] when the spec only describes one in prose.
+
+    A directional entry counts when it has a numeric [x, y, z] `position` and an `intensity`; a
+    hemisphere entry when it has `skyColor`, `groundColor` and `intensity`. Prose-only entries (the
+    starter spec's) yield [], which keeps the template rig, so existing specs are unchanged.
+    """
+    rig: list[dict[str, Any]] = []
+    if not isinstance(lighting, list):
+        return rig
+    for item in lighting:
+        if not isinstance(item, dict):
+            continue
+        intensity = _num(item.get("intensity"))
+        if intensity is None or intensity < 0:
+            continue
+        if item.get("type") == "directional":
+            position = item.get("position")
+            if not (isinstance(position, list) and len(position) == 3 and all(_num(v) is not None for v in position)):
+                continue
+            color = item.get("color") if isinstance(item.get("color"), str) and _HEX_COLOR.match(item["color"]) else "#ffffff"
+            rig.append({"type": "directional", "position": [float(v) for v in position], "color": color,
+                        "intensity": intensity, "castShadow": item.get("castShadow") is True})
+        elif item.get("type") == "hemisphere":
+            sky, ground = item.get("skyColor"), item.get("groundColor")
+            if isinstance(sky, str) and _HEX_COLOR.match(sky) and isinstance(ground, str) and _HEX_COLOR.match(ground):
+                rig.append({"type": "hemisphere", "skyColor": sky, "groundColor": ground, "intensity": intensity})
+    return rig if any(light["type"] == "directional" for light in rig) else []
+
+
+def photo_tone_exposure(lighting: Any) -> float | None:
+    """`exposure` from a lightingFromPhoto tone entry (id "tone" or carrying toneMapping), if numeric."""
+    if not isinstance(lighting, list):
+        return None
+    for item in lighting:
+        if isinstance(item, dict) and (item.get("id") == "tone" or "toneMapping" in item):
+            exposure = _num(item.get("exposure"))
+            if exposure is not None and exposure > 0:
+                return exposure
+    return None
+
+
 def geometry_for(
     primitive: str,
     component: dict[str, Any] | None = None,
@@ -3893,6 +3942,8 @@ def generate(spec: dict[str, Any], pass_id: str) -> str:
 
     look_dev_targets = spec.get("lookDevTargets", {})
     lighting_from_photo = spec.get("lightingFromPhoto", [])
+    photo_rig = photo_light_rig(lighting_from_photo)
+    tone_exposure = photo_tone_exposure(lighting_from_photo)
     lines.extend(
         [
             "",
@@ -3909,6 +3960,50 @@ def generate(spec: dict[str, Any], pass_id: str) -> str:
             "): THREE.Group {",
             "  const lights = new THREE.Group();",
             f"  lights.name = {json.dumps(target + ' look-dev lights')};",
+            # 'reference' mode reproduces the photo. When the spec measured a rig (directional
+            # lights with positions), emit THAT instead of the template below, so the
+            # lighting-pass decision lives in the spec rather than being lost to fixed numbers.
+            *(
+                [
+                    # Typed loosely on purpose: a JSON literal of mixed light shapes is a union type,
+                    # and `l.position` / `l.skyColor` would not compile under strict tsc.
+                    f"  const photoRig: Array<Record<string, any>> = {json_literal(photo_rig)};",
+                    # `&& photoRig.length > 0` is load-bearing for tsc: with a bare
+                    # `mode === 'reference'` + return, TS narrows `mode` for the template below
+                    # and its own `mode === 'reference'` comparisons fail with TS2367.
+                    "  if (mode === 'reference' && photoRig.length > 0) {",
+                    "    for (const l of photoRig) {",
+                    "      if (l.type === 'hemisphere') {",
+                    "        lights.add(new THREE.HemisphereLight(l.skyColor, l.groundColor, l.intensity));",
+                    "        continue;",
+                    "      }",
+                    "      const d = new THREE.DirectionalLight(l.color, l.intensity);",
+                    "      d.position.set(l.position[0], l.position[1], l.position[2]);",
+                    "      if (l.castShadow) {",
+                    "        d.castShadow = true;",
+                    "        d.shadow.mapSize.set(4096, 4096);",
+                    "        d.shadow.bias = -0.00025;",
+                    "        d.shadow.normalBias = 0.018;",
+                    "        d.shadow.radius = 7;",
+                    "        d.shadow.camera.near = 0.5;",
+                    "        d.shadow.camera.far = 30;",
+                    "        d.shadow.camera.left = -2.6;",
+                    "        d.shadow.camera.right = 2.6;",
+                    "        d.shadow.camera.top = 2.6;",
+                    "        d.shadow.camera.bottom = -2.6;",
+                    "        d.shadow.camera.updateProjectionMatrix();",
+                    "      }",
+                    "      lights.add(d);",
+                    "    }",
+                    "    lights.userData.reviewMode = mode;",
+                    "    lights.userData.rigSource = 'lightingFromPhoto';",
+                    f"    lights.userData.lightingFromPhoto = {json_literal(lighting_from_photo)};",
+                    "    return lights;",
+                    "  }",
+                ]
+                if photo_rig
+                else []
+            ),
             "  const hemi = new THREE.HemisphereLight(",
             "    mode === 'reference' ? 0xfff0d6 : 0xf2f4ff,",
             "    0x363b42,",
@@ -4025,6 +4120,11 @@ def generate(spec: dict[str, Any], pass_id: str) -> str:
             "  // the environment reflection reads flat/washed instead of a believable metal response.",
             "  renderer.toneMapping = THREE.ACESFilmicToneMapping;",
             "  renderer.outputColorSpace = THREE.SRGBColorSpace;",
+            *(
+                [f"  renderer.toneMappingExposure = {tone_exposure};  // lightingFromPhoto tone.exposure"]
+                if tone_exposure is not None
+                else []
+            ),
             "}",
             "",
             f"export function create{type_name}InspectControls(",
