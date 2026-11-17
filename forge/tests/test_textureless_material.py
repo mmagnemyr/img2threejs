@@ -141,6 +141,28 @@ class QualityBar(unittest.TestCase):
         self.assertEqual(len(offenders), 1, warnings)
         self.assertIn("painted-metal", offenders[0])
 
+    def test_the_material_pass_gate_honours_the_declaration(self):
+        """The build-pass gate must agree with the validator.
+
+        `orchestrate_passes.material_pass_gaps` gates `--pass-id material-pass` in the generator.
+        It used to apply the texture-channel bar to a declared-textureless material that strict
+        validation had already accepted, so the spec validated and the material pass could never
+        be generated.
+        """
+        import orchestrate_passes
+
+        palette = {"albedo": {"dominant": "#2e2a28", "secondary": ["#3a3532"]},
+                   "localOverrides": [{"id": "chip", "kind": "chip"}]}
+        declared = quality_first_spec([base_material(textureless=DECLARED, **palette)])
+        gaps = orchestrate_passes.material_pass_gaps(declared)
+        self.assertFalse(any("textureResolution must be >=" in gap for gap in gaps), gaps)
+        undeclared = quality_first_spec([base_material(**palette)])
+        self.assertTrue(
+            any("textureResolution must be >=" in gap
+                for gap in orchestrate_passes.material_pass_gaps(undeclared)),
+            "negative control: an undeclared material must still hit the texture-channel bar",
+        )
+
     def test_the_declaration_is_hard_validated_through_validate_materials(self):
         errors: list[str] = []
         warnings: list[str] = []
