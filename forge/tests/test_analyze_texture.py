@@ -87,6 +87,20 @@ class AnalyzeTextureTest(unittest.TestCase):
         self.assertEqual(r["finishClass"], "worn-composite")
         self.assertAlmostEqual(r["recipe"]["roughness"], 0.9)
 
+    def test_smooth_bright_gradient_is_not_brushed(self):
+        """A glossy white enamel wall: a soft one-axis shading gradient and no grain.
+
+        The streak ratio of two near-zero energies is noise, so without the energy floor this was
+        classified brushed-steel and written back with metalness 1.0 (DEF-7).
+        """
+        def fn(x, y):
+            v = 215 - x * 0.35 + ((x * 7 + y * 13) % 3)  # gradient across x, +/-1 level of noise
+            return (cl(v - 4), cl(v), cl(v + 3))
+        r = analyze(self._mk("enamel.png", fn))
+        self.assertNotEqual(r["finishClass"], "brushed-steel", r["stats"])
+        self.assertLess(r["recipe"]["metalness"], 0.5)
+        self.assertLess(r["stats"]["streakEnergy"], 0.02)
+
     def test_directional_streaks_is_brushed_steel(self):
         # coarse bright horizontal grain (bands vary in Y, survive downsample), neutral -> brushed
         def fn(x, y):

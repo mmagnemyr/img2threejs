@@ -39,6 +39,10 @@ RECIPES: dict[str, dict[str, Any]] = {
 }
 
 N = 64  # downsample grid for stats
+# Minimum mean high-frequency luminance step (fraction of 255) along the dominant direction before
+# a neutral surface may be called brushed: ~5 levels. Smooth enamel measured 0.003-0.006; the
+# synthetic 8 px grain in the tests measures ~0.09.
+MIN_STREAK_ENERGY = 0.02
 
 
 def _sample(pixels, w, h, mask):
@@ -113,13 +117,19 @@ def analyze(path: str | Path) -> dict[str, Any]:
     hf_v = sum(abs(lums[j * N + i] - lums[(j - 1) * N + i]) for j in range(1, N) for i in range(N)) / (N * (N - 1))
     streak_ratio = hf_h / (hf_v + 1e-6)
     anisotropy = max(streak_ratio, 1.0 / (streak_ratio + 1e-6))  # directional either axis
+    # The ratio alone is noise on a smooth surface: two near-zero high-frequency energies divide
+    # into an arbitrary "anisotropy". Glossy white enamel (mottle 0.003, a soft shading gradient
+    # across a narrow crop) scored 2.3 and was written back as brushed steel, metalness 1.0.
+    # Brushing needs real streak energy in its dominant direction as well as a ratio.
+    streak_energy = max(hf_h, hf_v) / 255.0
 
     # specular fraction → metalness proxy
     spec_frac = sum(1 for lv in lums if lv > 235) / n
 
     # ---- classify ----
     if mean_sat < 0.18:  # near-neutral / grey → metal or worn
-        if anisotropy > 1.9 and (mean_lum > 95 or spec_frac > 0.03):  # bright directional = brushed metal
+        if (anisotropy > 1.9 and streak_energy > MIN_STREAK_ENERGY
+                and (mean_lum > 95 or spec_frac > 0.03)):  # bright, really streaked = brushed metal
             finish = "brushed-steel"
         elif spec_frac > 0.05 and mean_lum > 140:   # bright smooth specular = polished steel
             finish = "brushed-steel"
@@ -187,6 +197,7 @@ def analyze(path: str | Path) -> dict[str, Any]:
             "gradientStrength": round(gradient_strength, 3),
             "mottle": round(mottle, 3),
             "streakRatio": round(streak_ratio, 2),
+            "streakEnergy": round(streak_energy, 4),
             "hueSpread": round(hue_spread, 3),
             "specularFraction": round(spec_frac, 3),
         },
