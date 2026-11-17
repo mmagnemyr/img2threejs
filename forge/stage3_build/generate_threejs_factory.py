@@ -1792,6 +1792,26 @@ def stand_proud_ring_stack(component: dict[str, Any]) -> list[list[float]] | Non
     return None
 
 
+def has_authored_path(primitive: str, descriptor: dict[str, Any]) -> bool:
+    """True when a `tube`/`curve-sweep` carries its own measured path (>= 2 points).
+
+    `tube` and `curve-sweep` are ATTACHMENT_PRIMITIVES, so an attachment block used to replace
+    them with a straight cylinder between attachment.localStart and localEnd. That is right for
+    a limb authored only by its two endpoints, and wrong for a part whose shape IS its path: a
+    D-shaped mug handle has both roots on the same wall, so start->end is a short vertical bar
+    and the loop disappeared. An authored path therefore wins; the attachment stays a contract.
+    """
+    if primitive == "tube":
+        path = descriptor.get("tubePath")
+        points = path.get("points") if isinstance(path, dict) else None
+    elif primitive == "curve-sweep":
+        sweep = descriptor.get("curveSweep")
+        points = sweep.get("spine") if isinstance(sweep, dict) else None
+    else:
+        return False
+    return isinstance(points, list) and len(points) >= 2
+
+
 def geometry_for(
     primitive: str,
     component: dict[str, Any] | None = None,
@@ -3523,6 +3543,12 @@ def generate(spec: dict[str, Any], pass_id: str) -> str:
         visual_hull = descriptor.get("visualHull") if isinstance(descriptor, dict) else None
         is_implicit = component.get("topologyClass") == "implicit" and isinstance(sdf, dict)
         is_visual_hull = isinstance(visual_hull, dict)
+        # Endpoint-derived cylinder only for attachment primitives WITHOUT their own path.
+        endpoint_geometry = (
+            primitive in ATTACHMENT_PRIMITIVES
+            and not is_implicit
+            and not has_authored_path(primitive, geometry_descriptor)
+        )
         iterations = subdivision_iterations(component)
         effective_primitive = resolve_instanced_cluster_base(primitive, geometry_descriptor, VALID_PRIMITIVES)
         if is_visual_hull:
@@ -3588,7 +3614,7 @@ def generate(spec: dict[str, Any], pass_id: str) -> str:
                 "",
                 *(
                     [f"  const {attachment_var} = {json.dumps(attachment, ensure_ascii=False)};"]
-                    if primitive in ATTACHMENT_PRIMITIVES and not is_implicit
+                    if endpoint_geometry
                     else []
                 ),
                 # Endpoint-DERIVED GEOMETRY only for primitives that are attachment shapes.
@@ -3614,7 +3640,9 @@ def generate(spec: dict[str, Any], pass_id: str) -> str:
                     # moved the node to `attachment.localStart`: a head authored at y 0.705 was
                     # emitted at y -0.195, inside the body, and the model rendered with no head at
                     # all.
-                    if primitive in ATTACHMENT_PRIMITIVES and not is_implicit
+                    # `has_authored_path` likewise: a tube/curve-sweep with its own measured
+                    # path keeps that path (see has_authored_path).
+                    if endpoint_geometry
                     # `makeAttachmentEndpoint(null)` rather than a bare `null`, so the
                     # binding keeps its `AttachmentEndpoint | null` type. A literal null narrows to
                     # `never` and every later `endpoint.start` stops compiling.
