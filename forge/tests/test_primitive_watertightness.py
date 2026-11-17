@@ -112,7 +112,9 @@ EXPECTED_WATERTIGHT_EVEN_RAW = {"capsule"}
 # card, a tube with no end caps (closed: false, the generator's default), and the
 # generator's default lathe profile (points [[0.3,-0.5],[0.15,0],[0.3,0.5]]) which
 # never touches the lathe axis at either end, i.e. an open vessel with no caps.
-EXPECTED_OPEN_BY_DESIGN = {"plane-card", "tube", "lathe"}
+# A decal is a patch clipped out of another component's surface (three DecalGeometry): open by
+# design, and it needs a target, so the probe projects it onto the root box's +Z face.
+EXPECTED_OPEN_BY_DESIGN = {"plane-card", "tube", "lathe", "decal"}
 # Confirmed, unfixed defects (see module docstring) -- pinned to their measured
 # values as a regression tripwire, not silently ignored. If a future fix changes
 # these numbers, update this dict together with the fix, do not just relax it.
@@ -162,6 +164,10 @@ def build_probe_spec() -> dict:
         }
         if primitive == "ground-blade":
             component["geometryDescriptor"] = _ground_blade_descriptor()
+        if primitive == "decal":
+            component["geometryDescriptor"] = {"decal": {
+                "target": "root", "position": [0.0, 0.0, 0.5], "orientation": [0.0, 0.0, 0.0],
+                "size": [0.5, 0.5, 0.5], "texture": "probe-decal.png"}}
         components.append(component)
     return {
         "targetName": "Primitive Watertightness Probe",

@@ -1792,6 +1792,69 @@ def stand_proud_ring_stack(component: dict[str, Any]) -> list[list[float]] | Non
     return None
 
 
+def emit_decals(decals: list[dict[str, Any]], materials: dict[str, Any]) -> list[str]:
+    """Emit `primitive: "decal"` components: the reference's own pixels projected onto a built mesh.
+
+    Projection-first is the skill's biggest fidelity lever (SKILL.md 2c), yet the generator had no
+    way to put a photo crop on a surface: every printed logo, stamp and scuff was a hand-written
+    shell in a factory patch. three's DecalGeometry clips the target's triangles against a box
+    projector and UV-maps them, so it works on any surface, not just cylinders. The decal mesh is
+    parented to its target (it rides it) and flagged `explodeWithParent` (a pick resolves to the
+    target). Position/orientation are in root space, which is world space while the model is built.
+    """
+    lines: list[str] = []
+    for index, component in enumerate(decals):
+        component_id = str(component.get("id"))
+        descriptor = component.get("geometryDescriptor") if isinstance(component.get("geometryDescriptor"), dict) else {}
+        decal = descriptor.get("decal") if isinstance(descriptor.get("decal"), dict) else {}
+        target = str(decal.get("target") or "")
+        material_id = str(component.get("material") or next(iter(materials.keys()), "base"))
+        alpha = decal.get("alphaTest", 0.5)
+        alpha = float(alpha) if isinstance(alpha, (int, float)) and not isinstance(alpha, bool) else 0.5
+        var = local_var("decal", component_id, index)
+        lines.extend(
+            [
+                "",
+                f"  // decal {json.dumps(component_id)}: reference pixels projected onto {json.dumps(target)}",
+                "  root.updateMatrixWorld(true);",
+                f"  const {var}Target = meshes[{json.dumps(target)}];",
+                f"  if ({var}Target) {{",
+                f"    const {var}Geometry = new DecalGeometry(",
+                f"      {var}Target,",
+                f"      new THREE.Vector3({vector(decal.get('position'), [0, 0, 0])}),",
+                f"      new THREE.Euler({vector(decal.get('orientation'), [0, 0, 0])}),",
+                f"      new THREE.Vector3({vector(decal.get('size'), [0.1, 0.1, 0.1])}),",
+                "    );",
+                # DecalGeometry is built in world space; bring it into the target's local frame so
+                # the decal rides the target through explode, poses and transforms.
+                f"    {var}Geometry.applyMatrix4(new THREE.Matrix4().copy({var}Target.matrixWorld).invert());",
+                f"    const {var}Material = ((materialMap[{json.dumps(material_id)}] as THREE.MeshStandardMaterial | undefined)"
+                " ?? new THREE.MeshStandardMaterial()).clone();",
+                f"    const {var}Texture = new THREE.TextureLoader().load({json.dumps(str(decal.get('texture') or ''))});",
+                f"    {var}Texture.colorSpace = THREE.SRGBColorSpace;",
+                f"    {var}Material.map = {var}Texture;",
+                f"    {var}Material.color.set(0xffffff);",
+                f"    {var}Material.transparent = true;",
+                f"    {var}Material.alphaTest = {alpha};",
+                f"    {var}Material.depthWrite = false;",
+                f"    {var}Material.polygonOffset = true;",
+                f"    {var}Material.polygonOffsetFactor = -4;",
+                f"    const {var} = new THREE.Mesh({var}Geometry, {var}Material);",
+                f"    {var}.name = {json.dumps(str(component.get('name') or component_id))};",
+                f"    {var}.renderOrder = 1;",
+                f"    {var}.castShadow = false;",
+                f"    {var}.receiveShadow = options.receiveShadow ?? true;",
+                f"    {var}.userData.sculptComponent = {json.dumps(component, ensure_ascii=False)};",
+                f"    {var}.userData.explodeWithParent = true;",
+                f"    {var}Target.add({var});",
+                f"    meshes[{json.dumps(component_id)}] = {var};",
+                f"    nodes[{json.dumps(component_id)}] = {var};",
+                "  }",
+            ]
+        )
+    return lines
+
+
 _HEX_COLOR = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 
@@ -2394,6 +2457,11 @@ def generate(spec: dict[str, Any], pass_id: str) -> str:
         "import { BokehPass } from 'three/examples/jsm/postprocessing/BokehPass.js';",
         "import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';",
         "import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';",
+        *(
+            ["import { DecalGeometry } from 'three/examples/jsm/geometries/DecalGeometry.js';"]
+            if any(c.get("primitive") == "decal" for c in components)
+            else []
+        ),
         "",
         "export type ProceduralModelOptions = {",
         "  wireframe?: boolean;",
@@ -2519,7 +2587,8 @@ def generate(spec: dict[str, Any], pass_id: str) -> str:
         geometry_descriptor = descriptor if isinstance(descriptor, dict) else {}
         is_implicit = component.get("topologyClass") == "implicit" and isinstance(geometry_descriptor.get("sdf"), dict)
         is_visual_hull = isinstance(geometry_descriptor.get("visualHull"), dict)
-        return not is_implicit and not is_visual_hull
+        is_decal = component.get("primitive") == "decal"  # built from its target by DecalGeometry
+        return not is_implicit and not is_visual_hull and not is_decal
 
     used_primitives = {
         str(component.get("primitive")) for component in components if _calls_geometry_for(component)
@@ -3645,11 +3714,17 @@ def generate(spec: dict[str, Any], pass_id: str) -> str:
         if rig_is_bone_track(spec) else set()
     )
 
+    deferred_decals: list[dict[str, Any]] = []
     for index, component in enumerate(components):
         component_id = str(component.get("id") or f"component-{index}")
         component_var = local_var("mesh", component_id, index)
         node_var = local_var("node", component_id, index)
         primitive = str(component.get("primitive") or "box")
+        if primitive == "decal":
+            # Projected onto its target's built surface, so it is emitted after every component
+            # (a decal may legally precede its target in componentTree).
+            deferred_decals.append(component)
+            continue
         if primitive not in VALID_PRIMITIVES:
             primitive = "box"
         transform = component.get("transform", {}) if isinstance(component.get("transform"), dict) else {}
@@ -4056,6 +4131,7 @@ def generate(spec: dict[str, Any], pass_id: str) -> str:
                 "  }",
             ])
 
+    lines.extend(emit_decals(deferred_decals, materials))
     lines.extend(emit_rig_hierarchy(spec))
 
     look_dev_targets = spec.get("lookDevTargets", {})

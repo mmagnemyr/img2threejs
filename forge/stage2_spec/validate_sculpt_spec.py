@@ -56,6 +56,8 @@ VALID_PRIMITIVES = {
     "tapered-sweep",
     "plane-card",
     "instanced-cluster",
+    # reference pixels projected onto another component (three DecalGeometry); see validate_decal
+    "decal",
 }
 VALID_COMPONENT_LEVELS = {"macro", "meso", "micro"}
 # Roles that are expected to declare `standProud`. Hair is the only one so far, and it earned the
@@ -1438,6 +1440,39 @@ def validate_color_material_recipe(component_id: str, recipe: Any, warnings: lis
             )
 
 
+def validate_decal(component: dict[str, Any], ids: set[str], errors: list[str]) -> None:
+    """`primitive: "decal"`: reference pixels projected onto another component's surface.
+
+    geometryDescriptor.decal = {target, position[3], orientation[3] (Euler radians), size[3] (> 0),
+    texture (path/URL), alphaTest? (0..1)}. Position/orientation are in the model's root space; the
+    projector is a box of `size` (width, height, projection depth) looking down its local -Z.
+    """
+    component_id = component["id"]
+    descriptor = component.get("geometryDescriptor")
+    decal = descriptor.get("decal") if isinstance(descriptor, dict) else None
+    label = f"component {component_id!r} decal"
+    if not isinstance(decal, dict):
+        errors.append(f"{label}: geometryDescriptor.decal object is required for primitive 'decal'")
+        return
+    target = decal.get("target")
+    if not isinstance(target, str) or target not in ids:
+        errors.append(f"{label}: target must name an existing component, got {target!r}")
+    elif target == component_id:
+        errors.append(f"{label}: target cannot be the decal itself")
+    for field in ("position", "orientation", "size"):
+        if not as_number_list(decal.get(field), 3):
+            errors.append(f"{label}: {field} must be [number, number, number]")
+    size = decal.get("size")
+    if as_number_list(size, 3) and any(float(v) <= 0 for v in size):
+        errors.append(f"{label}: size values must be > 0")
+    texture = decal.get("texture")
+    if not isinstance(texture, str) or not texture.strip():
+        errors.append(f"{label}: texture must be a non-empty path or URL")
+    alpha = decal.get("alphaTest")
+    if alpha is not None and (not is_number(alpha) or not 0 <= float(alpha) <= 1):
+        errors.append(f"{label}: alphaTest must be a number from 0 to 1")
+
+
 def validate_components(
     spec: dict[str, Any],
     material_ids: set[str],
@@ -1631,6 +1666,12 @@ def validate_components(
             errors.append(
                 f"component {component_id!r} standProud references missing component {against!r}"
             )
+    decal_components = [
+        item for item in components
+        if isinstance(item, dict) and item.get("primitive") == "decal" and isinstance(item.get("id"), str)
+    ]
+    for component in decal_components:
+        validate_decal(component, ids, errors)
     if not ids:
         errors.append("at least one component is required")
     if len(ids) == 1:
