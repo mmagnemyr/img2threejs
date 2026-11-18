@@ -23,10 +23,24 @@ class OptionalVisionToolingTests(unittest.TestCase):
         self.assertEqual(command[1], str(ROOT.parent / "integrations" / "vision" / "reference_vision.py"))
         self.assertEqual(command[-1], "health")
 
-    def test_explicit_interpreter_override_is_resolved(self) -> None:
+    def test_explicit_interpreter_override_is_made_absolute(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             candidate = Path(directory) / "python"
-            self.assertEqual(MODULE.resolve_python(str(candidate)), candidate.resolve())
+            self.assertEqual(MODULE.resolve_python(str(candidate)), candidate.absolute())
+
+    def test_venv_interpreter_symlink_is_not_followed(self) -> None:
+        # A venv's bin/python links to the base interpreter; following the link loses the venv's
+        # site-packages (torch/transformers were "missing" from an installed environment).
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory) / "base-python"
+            base.write_text("")
+            link = Path(directory) / "venv" / "bin" / "python"
+            link.parent.mkdir(parents=True)
+            try:
+                link.symlink_to(base)
+            except OSError:
+                self.skipTest("symlinks unavailable on this platform")
+            self.assertEqual(MODULE.resolve_python(str(link)), link)
 
     def test_documentation_preserves_evidence_boundaries(self) -> None:
         documentation = (ROOT.parent / "docs" / "integrations" / "reference_fidelity_tooling.md").read_text(

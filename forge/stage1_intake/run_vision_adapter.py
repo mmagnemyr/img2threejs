@@ -17,7 +17,9 @@ ADAPTER = ROOT / "integrations" / "vision" / "reference_vision.py"
 
 def resolve_python(explicit: str | None) -> Path:
     configured = explicit or os.environ.get("IMG2THREEJS_VISION_PYTHON")
-    return Path(configured).expanduser().resolve() if configured else DEFAULT_PYTHON
+    # absolute(), never resolve(): a venv's bin/python is a symlink to the base interpreter, and
+    # following it drops the venv (its site-packages are found relative to the unresolved path).
+    return Path(configured).expanduser().absolute() if configured else DEFAULT_PYTHON
 
 
 def build_command(python: Path, forwarded: list[str]) -> list[str]:

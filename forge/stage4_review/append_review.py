@@ -158,6 +158,9 @@ def review_completes_pass(spec: dict, entry: dict, pass_id: str) -> bool:
     if entry.get("passId") != pass_id or entry.get("action") != "continue":
         return False
     visual = entry.get("visualEvidence")
+    reports = entry.get("gateReports")
+    if isinstance(reports, list) and any(isinstance(r, dict) and r.get("passed") is False for r in reports):
+        return False  # a hand-written continue over a failing blocking gate does not complete the pass
     if pass_id == "blockout" and not entry.get("mapStrippedRender"):
         return False
     viewpoints = entry.get("reviewViewpoints")
@@ -222,6 +225,51 @@ def sync_pipeline(spec: dict) -> None:
     )
 
 
+def gate_report_verdict(report: object) -> bool | None:
+    """True = passed, False = failed, None = not a recognisable gate report.
+
+    Reads the --json output of the off-axis gates: turntable_gate.py and attachment_anchor.py
+    (`passed`), self_intersection.py (`selfIntersecting`), and any report carrying `verdict`.
+    An `error` field is a failure: an unreadable mesh is not a clean bill of health.
+    """
+    if not isinstance(report, dict):
+        return None
+    if report.get("error"):
+        return False
+    if isinstance(report.get("passed"), bool):
+        return report["passed"]
+    if isinstance(report.get("selfIntersecting"), bool):
+        return not report["selfIntersecting"]
+    verdict = report.get("verdict")
+    if isinstance(verdict, str):
+        return verdict.lower() in {"pass", "passed", "ok"}
+    return None
+
+
+def load_gate_reports(values: list[str] | None) -> list[dict]:
+    """Parse repeated `--gate-report [name=]path.json` into recorded gate results."""
+    results = []
+    for value in values or []:
+        name, sep, path_text = value.partition("=")
+        if not sep:
+            name, path_text = "", value
+        path = Path(path_text).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(f"--gate-report file does not exist: {path}")
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"--gate-report {path} is not JSON: {exc}") from exc
+        passed = gate_report_verdict(report)
+        if passed is None:
+            raise ValueError(
+                f"--gate-report {path} has no recognisable verdict "
+                "(expected `passed`, `selfIntersecting` or `verdict`)"
+            )
+        results.append({"gate": name or path.stem, "path": str(path_text), "passed": passed})
+    return results
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("spec", type=Path)
@@ -256,6 +304,16 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--review-scene-json",
         help="Versioned review-scene metadata JSON used to validate the report",
+    )
+    parser.add_argument(
+        "--gate-report",
+        action="append",
+        metavar="[NAME=]PATH",
+        help=(
+            "--json output of a blocking gate (turntable_gate, self_intersection, attachment_anchor, ...); "
+            "repeatable. Recorded on the review; a failing report blocks action=continue. A spec that lists gate "
+            "names in selfCorrectLoop.visualAcceptance.requiredGateReports must attach those on every visual continue."
+        ),
     )
     parser.add_argument(
         "--require-screenshot-files",
@@ -295,6 +353,24 @@ def main(argv: list[str]) -> int:
             f"cannot record submitted pass {args.pass_id!r}; current unlocked pass is {expected_pass!r}. "
             f"Complete {expected_pass!r} before recording {args.pass_id!r}, or use --force-out-of-order for deliberate re-review."
         )
+    gate_reports = load_gate_reports(args.gate_report)
+    if args.action == "continue":
+        failing = [item["gate"] for item in gate_reports if not item["passed"]]
+        if failing:
+            raise ValueError(
+                "a blocking gate failed, so continue cannot be recorded: " + ", ".join(failing)
+                + "; fix the defect and re-run the gate, or record refine-spec/refine-code/request-input"
+            )
+        required_gates = visual_acceptance_config(spec).get("requiredGateReports", [])
+        if args.pass_id in VISUAL_PASS_IDS and isinstance(required_gates, list):
+            attached = {item["gate"] for item in gate_reports}
+            missing_gates = [g for g in required_gates if isinstance(g, str) and g not in attached]
+            if missing_gates:
+                raise ValueError(
+                    "visual pass cannot use action=continue without these gate reports: "
+                    + ", ".join(missing_gates) + " (attach with --gate-report NAME=PATH)"
+                )
+
     if args.pass_id == "blockout" and args.action == "continue" and not args.map_stripped_render:
         raise ValueError("blockout cannot be credited without --map-stripped-render (unlit, map-stripped evidence)")
     threshold = clamp_score(args.visual_threshold) if args.visual_threshold is not None else visual_acceptance_threshold(spec)
@@ -392,6 +468,8 @@ def main(argv: list[str]) -> int:
         "codeFixes": split_items(args.code_fixes),
         "evidence": split_items(args.evidence),
     }
+    if gate_reports:
+        entry["gateReports"] = gate_reports
     if args.force_out_of_order:
         entry["outOfSequence"] = True
     if args.map_stripped_render:
